@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax check
+        run: bash -n skills/inference-optimisation-macos/scripts/*.sh
+
+      - name: Python compile check
+        run: python3 -m py_compile skills/inference-optimisation-macos/scripts/*.py
+
+      - name: Run harness test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Live macOS probe & memory smoke test
+        if: runner.os == 'macOS'
+        run: |
+          bash skills/inference-optimisation-macos/scripts/probe_apple_silicon.sh
+          python3 skills/inference-optimisation-macos/scripts/mem_macos.py --pid $$ --json
