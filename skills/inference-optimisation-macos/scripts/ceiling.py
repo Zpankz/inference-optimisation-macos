@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdlib-only Apple Silicon roofline, KV-crossover, and unified-memory ceiling calculator."""
+"""Stdlib-only Apple Silicon roofline, looped-model, KV-crossover, and unified-memory ceiling calculator."""
 
 import argparse
 import json
@@ -90,7 +90,7 @@ def diagnose(
         if efficiency_pct > 95.0:
             notes.append(
                 "AUDIT MEASUREMENT: Observed tok/s exceeds 95% of theoretical peak bandwidth. "
-                "Check for prompt-cache hit cheating, wrong active_params, or token-count bugs."
+                "Check for prompt-cache hit cheating, wrong active_params/loop_passes, or token-count bugs."
             )
         elif efficiency_pct >= sat_floor:
             notes.append(
@@ -112,15 +112,21 @@ def diagnose(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compute Apple Silicon LLM decode ceilings, KV crossover, and unified-memory headroom."
+        description="Compute Apple Silicon LLM decode ceilings, looped-model traffic, KV crossover, and unified-memory headroom."
     )
     parser.add_argument("--list-chips", action="store_true", help="List built-in chip presets and exit")
     parser.add_argument("--chip", help="Apple Silicon chip preset (e.g., 'M4 Max 40-core', 'M5 Pro')")
-    parser.add_argument("--bw-gbs", type=float, help="Override peak memory bandwidth in decimal GB/s")
+    parser.add_argument("--bw-gbs", type=float, help="Override peak memory bandwidth in decimal GB/s (or pass measured Metal BW)")
     parser.add_argument("--ram-gb", type=float, help="Total unified RAM in GiB (e.g., 32, 64, 128)")
     parser.add_argument("--wired-limit-gb", type=float, help="Current iogpu.wired_limit_mb in GiB (optional)")
-    parser.add_argument("--active-params-b", type=float, help="Active parameters in billions (equals total for dense models)")
+    parser.add_argument("--active-params-b", type=float, help="Active parameters in billions per single pass (equals total for dense)")
     parser.add_argument("--total-params-b", type=float, help="Total parameters in billions (for MoE residency; defaults to active-params-b)")
+    parser.add_argument(
+        "--loop-multiplier",
+        type=float,
+        default=1.0,
+        help="Effective weight-read multiplier for looped transformers (e.g., ~2.0 for 24L model whose 12L core loops 3x; default: 1.0)",
+    )
     parser.add_argument("--bits", type=float, default=4.5, help="Effective bits per weight including scales/embeddings (default: 4.5)")
     parser.add_argument("--file-gb", type=float, help="Exact model weight file size in decimal GB (overrides total-params * bits)")
     parser.add_argument("--ctx", type=int, default=8192, help="Target context window in tokens (default: 8192)")
@@ -142,12 +148,13 @@ def main() -> int:
 
     if args.ram_gb is None or args.active_params_b is None:
         parser.error("--ram-gb and --active-params-b are required unless --list-chips is set.")
+    if args.loop_multiplier <= 0:
+        raise ValueError("--loop-multiplier must be > 0.")
 
     chip_label, bw_gbs = resolve_bandwidth(args.chip, args.bw_gbs)
     total_params_b = args.total_params_b if args.total_params_b is not None else args.active_params_b
     is_moe = total_params_b > args.active_params_b * 1.05
 
-    # Weight bytes in decimal bytes (matches Apple's decimal GB/s memory bandwidth spec).
     if args.file_gb is not None:
         total_weight_bytes = args.file_gb * 1e9
         effective_bits = (total_weight_bytes * 8.0) / (total_params_b * 1e9)
@@ -155,7 +162,8 @@ def main() -> int:
         effective_bits = args.bits
         total_weight_bytes = total_params_b * 1e9 * (effective_bits / 8.0)
 
-    active_weight_bytes = args.active_params_b * 1e9 * (effective_bits / 8.0)
+    # Effective active bytes per token accounts for looped layer visits (PR #22).
+    active_weight_bytes = args.active_params_b * args.loop_multiplier * 1e9 * (effective_bits / 8.0)
 
     if args.kv_bytes_per_token is not None:
         kv_bpt = args.kv_bytes_per_token
@@ -168,7 +176,6 @@ def main() -> int:
     kv_total_bytes = kv_single_ctx_bytes * args.concurrency
     kv_crossover_ctx = int(active_weight_bytes / max(kv_bpt, 1.0))
 
-    # Convert residency into GiB (1024^3) so it aligns directly with macOS hw.memsize & iogpu.wired_limit_mb.
     gib = float(1024**3)
     total_weight_gib = total_weight_bytes / gib
     active_weight_gb = active_weight_bytes / 1e9
@@ -178,6 +185,9 @@ def main() -> int:
     bw_bytes_per_s = bw_gbs * 1e9
     theo_tps_short = bw_bytes_per_s / active_weight_bytes
     theo_tps_full_ctx = bw_bytes_per_s / (active_weight_bytes + kv_single_ctx_bytes)
+    # Concurrent decode reads shared weights once per step and N*KV once per step (PR #1/#3/#24).
+    theo_agg_tps_conc = (bw_bytes_per_s / (active_weight_bytes + kv_total_bytes)) * args.concurrency
+
     band_low, band_high = (0.55, 0.72) if is_moe else (0.70, 0.85)
     realistic_low = theo_tps_short * band_low
     realistic_high = theo_tps_short * band_high
@@ -190,6 +200,7 @@ def main() -> int:
     result = {
         "chip": chip_label,
         "architecture": "moe" if is_moe else "dense",
+        "loop_multiplier": args.loop_multiplier,
         "peak_bandwidth_gbs": round(bw_gbs, 2),
         "ram_gib": args.ram_gb,
         "wired_limit_gib": round(wired_limit_gib, 2),
@@ -206,6 +217,7 @@ def main() -> int:
         "theoretical_decode_tps_short_ctx": round(theo_tps_short, 2),
         "realistic_decode_tps_band": [round(realistic_low, 2), round(realistic_high, 2)],
         "theoretical_decode_tps_full_ctx": round(theo_tps_full_ctx, 2),
+        "theoretical_aggregate_tps_at_concurrency": round(theo_agg_tps_conc, 2),
         "observed_tps": args.observed_tps,
         "observed_efficiency_pct": round(efficiency_pct, 1) if efficiency_pct is not None else None,
         "diagnostics": notes,
@@ -217,11 +229,13 @@ def main() -> int:
 
     band_pct = "55-72% MoE" if is_moe else "70-85% dense"
     print(f"=== Apple Silicon Roofline: {chip_label} ({bw_gbs:.1f} GB/s, {args.ram_gb:.0f} GiB RAM) ===")
-    print(f"Active weights:       {active_weight_gb:6.2f} GB   (total residency: {total_weight_gib:.2f} GiB @ {effective_bits:.2f} bpp)")
+    print(f"Active weights/step:  {active_weight_gb:6.2f} GB   (residency: {total_weight_gib:.2f} GiB @ {effective_bits:.2f} bpp, loop x{args.loop_multiplier:.2f})")
     print(f"KV cache ({args.ctx} tok x {args.concurrency}): {kv_total_gib:6.2f} GiB  ({kv_bpt / 1024:.1f} KiB/tok; crossover: {kv_crossover_ctx} tok)")
     print(f"Estimated footprint:  {total_footprint_gib:6.2f} GiB  ({mem_ratio * 100:.1f}% of RAM; wired cap: {wired_limit_gib:.1f} GiB)")
     print(f"Decode ceiling (short ctx): {theo_tps_short:6.2f} tok/s  (realistic {band_pct}: {realistic_low:.1f}-{realistic_high:.1f} tok/s)")
     print(f"Decode ceiling (full ctx):  {theo_tps_full_ctx:6.2f} tok/s")
+    if args.concurrency > 1:
+        print(f"Aggregate ceiling (c={args.concurrency}):   {theo_agg_tps_conc:6.2f} tok/s  (weights read once per step)")
     if efficiency_pct is not None:
         print(f"Observed decode:      {args.observed_tps:6.2f} tok/s  ({efficiency_pct:.1f}% of theoretical ceiling)")
     print("")

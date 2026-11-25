@@ -5,34 +5,35 @@ description: Ceiling-first, evidence-gated local LLM inference optimisation for 
 
 # inference-optimisation-macos
 
-Hill-climb local LLM serving speed on a single Apple Silicon Mac with mathematical ceilings, macOS-native unified-memory telemetry, interleaved A/B benchmarks, and anti-cheat quality gates. Every change is tested one lever at a time and kept only when it beats interleaved controls without breaking memory headroom, thermals, or long-context recall.
+Hill-climb local LLM serving speed on a single Apple Silicon Mac with mathematical ceilings, native Metal bandwidth measurement, macOS unified-memory telemetry, interleaved A/B benchmarks, and anti-cheat quality gates. Every change is tested one lever at a time and kept only when it beats interleaved controls above the empirical A/A noise floor without breaking memory headroom, thermals, or long-context recall.
 
 Note: Invoke bundled scripts using their path relative to this skill directory (for example, set `SKILL_DIR` to the folder containing this `SKILL.md`).
 
 ## When to Use
 
 - Optimising decode throughput (tok/s), time to first token (TTFT), prefill speed, concurrency, or startup latency on an Apple Silicon Mac.
-- Tuning `mlx_lm.server`, `vllm-mlx`, `oMLX`, `llama-server` (llama.cpp Metal), or custom MLX inference loops.
+- Choosing the fastest engine on a new Mac (`mlx_lm.server` vs `vllm-mlx` vs `oMLX` vs `llama-server`) before investing in flag tuning.
 - Diagnosing why a Mac LLM server is slower than expected, hitting swap cliffs, stalling on Metal allocations, or throttling GPU clocks.
 - Evaluating quantization, KV cache quantization, prompt caching, speculative decoding, MTP, or custom `mx.fast.metal_kernel` changes under controlled A/B tests.
 - Building a reproducible benchmark ledger and qualification gate before deploying a local Mac model server.
 
 ## Core Principles
 
-- **Ceilings before tuning**: Compute the theoretical memory-bandwidth decode ceiling, KV-crossover context, and wired-memory headroom first. If single-stream decode is already at 75-85% of bandwidth (or 55-72% for sparse MoE), switch from decode flags to prefill, prompt caching, concurrency, or model/quantization levers.
-- **One lever at a time**: Never stack unmeasured flags. Change a single knob, run an interleaved `control -> candidate -> control` trial, and record both wins and rejections in `ledger.jsonl`.
-- **Single-GPU serialization**: An Apple Silicon Mac has one unified-memory GPU. Always serialize benchmark runs through `scripts/queue.sh` so overlapping processes never corrupt memory bandwidth or residency readings.
-- **Server-reported tokens only**: Measure decode and prefill rates from server-reported `usage` / `timings` fields alongside wall-clock TTFT, never client-side character or word heuristics.
-- **No silent quality regressions**: Every candidate that touches quantization, KV cache precision, attention kernels, or speculative decoding must pass the long-context needle retrieval check, concurrent soak, and thermal stability gate before promotion.
+- **Best engine before flag tuning**: On Apple Silicon, picking the right runtime (`mlx_lm.server`, `vllm-mlx`, `oMLX`, or `llama-server`) often beats the first ten flag tweaks. Use `bench.py screen` and `references/onboarding.md` on a new machine first.
+- **Ceilings before tuning**: Measure real sustained unified-memory bandwidth (`swift scripts/measure_bw_metal.swift`) and compute the theoretical decode ceiling (`scripts/ceiling.py`) first. If single-stream decode is already at 75-85% of bandwidth (or 55-72% for sparse MoE), switch from decode flags to prefill, prompt caching, concurrency, or active-byte levers.
+- **One lever at a time, above the A/A noise floor**: Never stack unmeasured flags. Run an A/A baseline check (`bench.py aa`) to measure host noise, then run interleaved `control -> candidate -> control` trials and log both wins and dead ends in `PLAN.md` / `DEAD-ENDS.md` and `ledger.jsonl`.
+- **Single-GPU serialization**: Always serialize benchmark runs through `scripts/queue.sh` (portable `fcntl.flock` in a private per-user `0700` directory) so overlapping jobs never share unified memory bandwidth.
+- **Reject broken speedups automatically**: `bench.py` flags and excludes `COALESCED` (<50 ms decode window), `DEGENERATE` (char-flood / n-gram loops), and `IMPLAUSIBLE` samples so broken configs can never win a sweep.
 
 ## Steps
 
-### 1. Probe Hardware, Thermals, and Runtimes
+### 1. Probe Hardware, Thermals, and Measured Metal Bandwidth
 
-Run the environment probe before touching any server flags so you know the exact SoC, GPU core bin, RAM, wired GPU limit, power source, thermal state, memory pressure, and installed engines.
+Run the environment probe and (optionally) the native Swift/Metal bandwidth micro-benchmark so your ceiling uses measured GB/s rather than spec-sheet guesses:
 
 ```bash
 bash "$SKILL_DIR/scripts/probe_apple_silicon.sh"
+swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
 ```
 
 Verify all `[PASS]` hygiene checks before benchmarking (full checklist in `references/methodology.md`):
@@ -44,7 +45,7 @@ Verify all `[PASS]` hygiene checks before benchmarking (full checklist in `refer
 
 ### 2. Calculate Hardware Ceilings and Memory Headroom
 
-Compute the theoretical single-stream decode ceiling, KV-crossover context, KV cache footprint, and safe wired-memory budget using `scripts/ceiling.py` and `references/ceilings.md`.
+Compute the theoretical single-stream decode ceiling, aggregate concurrent ceiling, KV-crossover context, and safe wired-memory budget using `scripts/ceiling.py` and `references/ceilings.md`. For looped MoE models (e.g., 3-pass loop cores), pass `--loop-multiplier` so layer visits are not undercounted.
 
 ```bash
 python3 "$SKILL_DIR/scripts/ceiling.py" \
@@ -58,39 +59,41 @@ python3 "$SKILL_DIR/scripts/ceiling.py" \
   --concurrency 2
 ```
 
-Use the ceiling output to classify your bottleneck before picking levers:
+### 3. Screen Candidate Engines (New Machine) and Capture Baseline
 
-- **Memory-bandwidth bound (decode < 70% of ceiling for dense, < 55% for MoE)**: Focus on wired memory limits, Metal Flash Attention, weight/KV layout, `mx.compile` retracing, or redundant host-GPU syncs.
-- **Already near bandwidth ceiling**: Stop chasing micro-flags for single-stream decode. Target active bytes per token (quantization, MoE routing), speculative decoding/MTP (only if bandwidth permits), prompt caching, or concurrency.
-- **Compute bound (slow TTFT / prefill)**: Tune batch/micro-batch sizes (`-b`, `-ub`), Metal Flash Attention, prompt prefix caching, and chunked prefill.
-- **Memory-cap bound (peak footprint > 75% of RAM or > `iogpu.wired_limit_mb`)**: Raise `iogpu.wired_limit_mb` safely (up to 75-80% of physical RAM on 32 GB+ Macs, leaving OS headroom), cap `--ctx-size`, or test KV cache quantization.
+If you have not picked an engine yet, follow `references/onboarding.md` and run a ~60-second `bench.py screen` bake-off across 2-3 engines (checking prose decode, code decode, two-turn prefix-cache speedup, and greedy determinism):
 
-### 3. Capture a Verified Baseline
+```bash
+bash "$SKILL_DIR/scripts/queue.sh" screen-mlx -- \
+  python3 "$SKILL_DIR/scripts/bench.py" screen \
+    --base-url http://127.0.0.1:8080/v1 \
+    --model "<model-id>" \
+    --label "screen-mlx" \
+    --mem-pid <server-pid> \
+    --ledger ledger.jsonl
+```
 
-Create a `PLAN.md` file in your working directory stating the target model, hardware ceiling, memory cap, quality gate, and ranked hypothesis queue. Capture unified-memory telemetry alongside a baseline benchmark serialized via `scripts/queue.sh`:
+Once the winning engine is selected, create `PLAN.md` and `DEAD-ENDS.md`, then capture a baseline with `bench.py baseline` and compute your empirical A/A noise floor:
 
 ```bash
 bash "$SKILL_DIR/scripts/queue.sh" baseline -- \
   python3 "$SKILL_DIR/scripts/bench.py" baseline \
     --base-url http://127.0.0.1:8080/v1 \
     --model "<model-id>" \
-    --label "baseline" \
-    --runs 5 \
+    --label "ctl-pre-1" \
+    --runs 10 \
     --prompt-tokens 1024 \
     --max-tokens 256 \
+    --calibrate-tokenizer \
     --mem-pid <server-pid> \
     --ledger ledger.jsonl
-```
 
-Compare baseline decode tok/s against `ceiling.py --observed-tps <tok_s>` to establish `% of theoretical ceiling`.
+python3 "$SKILL_DIR/scripts/bench.py" aa --ledger ledger.jsonl --label "ctl-pre-1"
+```
 
 ### 4. Hill-Climb One Lever at a Time
 
-Consult `references/levers.md` for the ordered Apple Silicon lever playbook matching your runtime:
-
-- **Layer 1 (macOS / Metal system)**: `sysctl iogpu.wired_limit_mb`, `caffeinate -dims`, process priority, power mode.
-- **Layer 2 (MLX / mlx-lm / vllm-mlx / oMLX)**: `mx.set_wired_limit`, `mx.set_cache_limit`, prompt cache reuse, KV quantization (`--kv-bits`, `--quantized-kv-start`), `mx.compile` retracing audit, `mx.fast.*` and `mx.fast.metal_kernel` escalation ladder.
-- **Layer 3 (llama.cpp Metal / llama-server)**: The 7 high-impact Apple Silicon flags (`-ngl 99`, `-fa on`, explicit `-c`, `-b`/`-ub`, `--cache-type-k/v`, `--mlock`, `--prio 2`) while stripping Linux/CUDA placebo flags.
+Consult `references/levers.md` for the ordered Apple Silicon lever playbook across macOS/Metal, MLX (`mlx-lm`, `vllm-mlx`, `oMLX`), and `llama.cpp` Metal (`llama-server`).
 
 Choose the interleaved A/B mode that fits your unified memory budget:
 
@@ -109,7 +112,7 @@ bash "$SKILL_DIR/scripts/queue.sh" ab-fa-on -- \
     --ledger ledger.jsonl
 ```
 
-- **Sequential single-server A/B** (standard for large models on unified memory): Run `bench.py baseline` in `control-pre -> candidate -> control-post` order (restarting cleanly between runs and verifying `mem_macos.py` shows swap and thermal pressure returned to baseline), then score the paired triad automatically:
+- **Sequential single-server A/B** (standard for large models on unified memory): Run `bench.py baseline` in `control-pre -> candidate -> control-post` order, then score the paired triad automatically:
 
 ```bash
 python3 "$SKILL_DIR/scripts/bench.py" compare \
@@ -120,21 +123,19 @@ python3 "$SKILL_DIR/scripts/bench.py" compare \
   --metric decode_tps
 ```
 
-Pass `--metric ttft_s` (lower is better) or `--metric prefill_tps` when tuning prefill/TTFT levers instead of decode throughput.
+Pass `--metric ttft_s` (lower is better) or `--metric prefill_tps` when tuning prefill/TTFT levers.
 
 Promote a lever only if:
 
-- Median improvement exceeds both measurement noise (control-vs-control drift) and at least 3% on the target metric.
-- Peak unified memory stays inside the configured memory cap with zero swap growth.
-- No secondary metric (TTFT, tail ITL, or concurrent throughput) regresses unacceptably.
-
-Log every accepted and rejected change with exact numbers in `PLAN.md` and `ledger.jsonl`.
+- Median improvement exceeds both control-vs-control drift AND the A/A noise floor (at least 3% default).
+- Zero `COALESCED`, `DEGENERATE`, or `IMPLAUSIBLE` sample flags fired.
+- Peak unified memory (including `IOAccelerator` GPU residency) stays inside the memory cap with zero swap growth.
 
 ### 5. Run Qualification and Anti-Cheat Gates
 
 Before declaring a tuned configuration production-ready, pass all three gates (details in `references/methodology.md`):
 
-- **Long-context needle gate**: Verify exact key retrieval across 10%, 50%, and 90% depth inside non-repeating filler sized to your target context window.
+- **Long-context needle gate**: Tokenizer-calibrated non-repeating filler at 10%, 50%, and 90% depth (`--max-tokens 512` for reasoning models).
 
 ```bash
 bash "$SKILL_DIR/scripts/queue.sh" needle-gate -- \
@@ -147,23 +148,17 @@ bash "$SKILL_DIR/scripts/queue.sh" needle-gate -- \
     --ledger ledger.jsonl
 ```
 
-- **Concurrency and KV soak gate**: Sweep concurrency (`bench.py concurrency --levels 1 2 4 --mem-pid <pid>`) to confirm memory stabilizes with zero swap thrashing or Metal OOM.
-- **Sustained thermal stability gate**: Run continuous generation (`bench.py soak --duration-s 180 --mem-pid <pid>`) to confirm final-minute decode tok/s stays within 5% of first-minute tok/s and `pmset -g therm` remains nominal.
+- **Concurrency and KV soak gate**: Sweep concurrency (`bench.py concurrency --levels 1 2 4 --mem-pid <pid>`) with zero errors and stable memory.
+- **Sustained thermal stability gate**: Run continuous generation (`bench.py soak --duration-s 180 --mem-pid <pid>`) confirming <= 5% thermal droop and nominal `pmset -g therm`.
 
 ### 6. Summarize and Hand Off
 
-Produce a concise final report directly from `ledger.jsonl` containing:
-
-- Hardware profile (chip, GPU core bin, RAM, bandwidth ceiling, `iogpu.wired_limit_mb`).
-- Baseline vs. final metrics (decode tok/s, `% of ceiling`, prefill tok/s, TTFT, concurrent tok/s, peak unified memory, thermal droop %).
-- Exact reproducible launch command and sysctl prerequisites.
-- Table of tested levers (kept vs. rejected and measured delta) so future sessions never re-test dead ends.
+Produce a concise final report directly from `ledger.jsonl` containing hardware profile (chip, GPU core bin, measured Metal BW, RAM, `iogpu.wired_limit_mb`), baseline vs. final metrics (`% of ceiling`, prefill, TTFT, concurrency, peak GPU/unified memory, thermal droop), exact reproducible launch command, and kept vs. rejected levers.
 
 ## Gotchas
 
-- **Default `iogpu.wired_limit_mb` causes silent swap or Metal OOM**: macOS caps wired GPU memory conservatively by default and resets it on reboot. Check `sysctl iogpu.wired_limit_mb` before blaming the engine, and never starve macOS (leave at least 20-25% RAM on 32-64 GB Macs, or 16-32 GB on 128-512 GB Macs).
-- **Speculative decoding and MTP can cut decode speed in half on base M-series chips**: On bandwidth-limited chips (M1-M4 base, 68-120 GB/s), verifying multiple draft tokens per step can read more memory than acceptance saves. Always A/B test draft count (`k=1, 2, 3`) against `k=0`.
-- **KV cache quantization is context-dependent**: `q8_0` or 4-bit KV helps decode speed only once KV read bytes become a meaningful fraction of active weight bytes (check `kv_crossover_ctx` in `ceiling.py`). Below that threshold, dequantization compute can slow decode down.
-- **Linux scripts break on macOS**: `flock` is not installed by default on macOS, and `/proc/<pid>/fdinfo` does not exist. Always use `scripts/queue.sh` and `scripts/mem_macos.py`.
-- **MLX lazy evaluation fakes benchmark numbers**: Timing MLX code without `mx.eval(...)` or `mx.synchronize(...)` measures graph construction, not GPU execution. Always synchronize before stopping timers and use `mx.get_*_memory()` rather than deprecated `mx.metal.*` aliases.
-- **Read `references/gotchas.md`** when encountering Metal allocation failures, `mx.compile` retracing stalls, headless Mac Studio low-clock states, or `llama-server` mmap hangs.
+- **Single-chunk coalesced SSE responses fake massive tok/s**: A degenerate model emitting `!!!!` in one chunk can report 100k+ tok/s. Never override `COALESCED` or `DEGENERATE` flags.
+- **Default `iogpu.wired_limit_mb` causes silent swap or Metal OOM**: Check `sysctl iogpu.wired_limit_mb` first and remember it resets on reboot.
+- **MTP / speculative draft depth depends on BOTH chip bandwidth and workload type**: Code edits reward deeper drafts (`k=3-5` on Max/Ultra), while fresh prose and base M-series chips (68-120 GB/s) often regress.
+- **Looped MoE models overstate ceilings by ~2x**: Always pass `--loop-multiplier` to `ceiling.py` when core layers execute multiple passes per token.
+- **Read `references/gotchas.md`** for headless Mac Studio stuck GPU clocks, `mx.compile` retracing, KV quantization regressions, and `--no-mmap` load hangs.

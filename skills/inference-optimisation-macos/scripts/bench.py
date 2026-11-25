@@ -3,11 +3,16 @@
 
 Supports:
   - baseline:    Warm-up + N streaming runs measuring TTFT, prefill tok/s, decode tok/s, ITL p50/p95
+  - screen:      Fast ~60s multi-workload smoke test (prose, code, two-turn prefix cache, greedy determinism)
   - ab:          Dual-server interleaved control -> candidate -> control A/B cycles with drift check
   - compare:     Score a sequential single-server control-pre / candidate / control-post triad from ledger.jsonl
+  - aa:          Compute empirical A/A noise floor (false-win rate & max noise %) from unchanged baseline runs
   - concurrency: Multi-client throughput sweep across concurrency levels
   - soak:        Continuous generation thermal stability gate (first-window vs final-window droop)
-  - needle:      Long-context non-repeating needle-in-a-haystack anti-cheat retrieval gate
+  - needle:      Long-context non-repeating needle-in-a-haystack gate with tokenizer-calibrated sizing
+
+Includes anti-cheat sample guards (PR #9): flags and excludes COALESCED (<50ms decode window),
+DEGENERATE (char-flood or n-gram loop), and IMPLAUSIBLE (>max_plausible_tps) samples from medians.
 """
 
 import argparse
@@ -32,6 +37,9 @@ except Exception:
     mem_macos = None
 
 
+MIN_DECODE_WINDOW_S = 0.05
+DEFAULT_MAX_PLAUSIBLE_TPS = 2500.0
+
 METRIC_SPECS = {
     "decode_tps": ("decode_tps_median", "higher"),
     "prefill_tps": ("prefill_tps_median", "higher"),
@@ -51,13 +59,27 @@ def percentile(values: list[float], p: float) -> float:
     return ordered[f] * (c - k) + ordered[c] * (k - f)
 
 
-def make_prompt(approx_tokens: int, allow_cache: bool) -> str:
+def is_degenerate(text: str) -> bool:
+    """Detect char-flood degeneration (e.g., 64x '!') and tight word n-gram looping."""
+    stripped = "".join(ch for ch in text if not ch.isspace())
+    if len(stripped) >= 16:
+        if (len(set(stripped)) / len(stripped)) < 0.05:
+            return True
+    words = text.split()
+    if len(words) >= 24:
+        ngrams = [tuple(words[i : i + 4]) for i in range(len(words) - 3)]
+        if ngrams and (len(set(ngrams)) / len(ngrams)) < 0.25:
+            return True
+    return False
+
+
+def make_prompt(approx_tokens: int, allow_cache: bool, chars_per_token: float = 4.0) -> str:
     nonce = "" if allow_cache else f"[nonce-{random.randint(100000, 999999)}] "
     base = (
         "Summarize the architectural trade-offs between unified memory bandwidth, "
         "KV cache precision, and prompt batching on Apple Silicon hardware. "
     )
-    target_chars = max(64, int(approx_tokens * 4))
+    target_chars = max(64, int(approx_tokens * chars_per_token))
     reps = max(1, (target_chars // len(base)) + 1)
     body = (base * reps)[:target_chars]
     return f"{nonce}{body}\nProvide a detailed technical explanation."
@@ -100,6 +122,8 @@ def stream_chat_completion(
     temperature: float = 0.0,
     api_key: str = "EMPTY",
     timeout: float = 300.0,
+    max_plausible_tps: float = DEFAULT_MAX_PLAUSIBLE_TPS,
+    min_decode_window_s: float = MIN_DECODE_WINDOW_S,
 ) -> dict[str, Any]:
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -160,7 +184,8 @@ def stream_chat_completion(
     t_end = time.perf_counter()
     total_s = max(t_end - t_start, 1e-9)
     ttft_s = (t_first - t_start) if t_first is not None else total_s
-    gen_s = max(t_end - (t_first if t_first is not None else t_start), 1e-9)
+    gen_s = max(t_end - (t_first if t_first is not None else t_start), 0.0)
+    output_text = "".join(text_parts)
 
     completion_tokens = usage.get("completion_tokens")
     prompt_tokens = usage.get("prompt_tokens")
@@ -175,11 +200,27 @@ def stream_chat_completion(
         completion_tokens = len(chunk_times)
         token_source = "sse_chunks_fallback"
 
+    flags: list[str] = []
+    decode_tps: float | None = None
+
     if "predicted_per_second" in timings and timings["predicted_per_second"]:
         decode_tps = float(timings["predicted_per_second"])
     else:
-        denom_tokens = max(completion_tokens - 1, 1) if completion_tokens > 1 else completion_tokens
-        decode_tps = denom_tokens / gen_s if completion_tokens > 0 else 0.0
+        # Guard against single-chunk coalesced responses producing fake 100k+ tok/s (PR #9)
+        if completion_tokens > 1 and gen_s < min_decode_window_s:
+            flags.append("COALESCED")
+            decode_tps = None
+        elif completion_tokens > 0 and gen_s > 0:
+            denom_tokens = max(completion_tokens - 1, 1) if completion_tokens > 1 else completion_tokens
+            decode_tps = denom_tokens / gen_s
+        else:
+            decode_tps = 0.0
+
+    if is_degenerate(output_text):
+        flags.append("DEGENERATE")
+
+    if decode_tps is not None and decode_tps > max_plausible_tps:
+        flags.append("IMPLAUSIBLE")
 
     if "prompt_per_second" in timings and timings["prompt_per_second"]:
         prefill_tps = float(timings["prompt_per_second"])
@@ -193,18 +234,43 @@ def stream_chat_completion(
         for i in range(1, len(chunk_times))
     ]
 
+    valid = len(flags) == 0 and decode_tps is not None
     return {
         "ttft_s": round(ttft_s, 4),
         "total_s": round(total_s, 4),
         "prefill_tps": round(prefill_tps, 2),
-        "decode_tps": round(decode_tps, 3),
+        "decode_tps": round(decode_tps, 3) if decode_tps is not None else None,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "token_source": token_source,
         "itl_p50_ms": round(percentile(itl_ms, 50), 2),
         "itl_p95_ms": round(percentile(itl_ms, 95), 2),
-        "output_text": "".join(text_parts),
+        "flags": flags,
+        "valid": valid,
+        "output_text": output_text,
     }
+
+
+def calibrate_chars_per_token(
+    base_url: str,
+    model: str,
+    api_key: str,
+    timeout: float,
+) -> float:
+    """Estimate actual chars/token from the server's own tokenizer using 2 short probes (PR #11)."""
+    samples: list[float] = []
+    for target_chars in (400, 1200):
+        prompt = " ".join(make_heterogeneous_filler(target_chars, seed=target_chars))
+        res = stream_chat_completion(
+            base_url, model, prompt, max_tokens=2, temperature=0.0, api_key=api_key, timeout=timeout,
+            min_decode_window_s=0.0,
+        )
+        pt = res.get("prompt_tokens")
+        if pt and pt > 10:
+            samples.append(len(prompt) / float(pt))
+    if not samples:
+        return 4.0
+    return max(1.5, min(8.0, statistics.median(samples)))
 
 
 def append_ledger(ledger_path: str | None, record: dict[str, Any]) -> None:
@@ -217,19 +283,29 @@ def append_ledger(ledger_path: str | None, record: dict[str, Any]) -> None:
 
 
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    tps = [r["decode_tps"] for r in runs]
-    pf = [r["prefill_tps"] for r in runs]
-    ttft = [r["ttft_s"] for r in runs]
-    itl95 = [r["itl_p95_ms"] for r in runs]
-    med_tps = statistics.median(tps)
+    valid_runs = [r for r in runs if r.get("valid", True) and r.get("decode_tps") is not None]
+    flagged_count = len(runs) - len(valid_runs)
+    use = valid_runs if valid_runs else runs
+
+    tps = [r["decode_tps"] for r in valid_runs if r["decode_tps"] is not None]
+    pf = [r["prefill_tps"] for r in use]
+    ttft = [r["ttft_s"] for r in use]
+    itl95 = [r["itl_p95_ms"] for r in use]
+
+    med_tps = statistics.median(tps) if tps else 0.0
     mad_tps = statistics.median([abs(x - med_tps) for x in tps]) if len(tps) > 1 else 0.0
+    all_flags = sorted({fl for r in runs for fl in r.get("flags", [])})
+
     return {
         "n": len(runs),
+        "valid_n": len(valid_runs),
+        "flagged_n": flagged_count,
+        "flags": all_flags,
         "decode_tps_median": round(med_tps, 3),
         "decode_tps_mad": round(mad_tps, 3),
-        "prefill_tps_median": round(statistics.median(pf), 2),
-        "ttft_s_median": round(statistics.median(ttft), 4),
-        "itl_p95_ms_median": round(statistics.median(itl95), 2),
+        "prefill_tps_median": round(statistics.median(pf), 2) if pf else 0.0,
+        "ttft_s_median": round(statistics.median(ttft), 4) if ttft else 0.0,
+        "itl_p95_ms_median": round(statistics.median(itl95), 2) if itl95 else 0.0,
         "token_sources": sorted({r["token_source"] for r in runs}),
     }
 
@@ -280,16 +356,24 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     for _ in range(args.warmup):
         stream_chat_completion(
             args.base_url, args.model, make_prompt(128, False), min(32, args.max_tokens),
-            api_key=args.api_key, timeout=args.timeout
+            api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
+
+    cpt = (
+        calibrate_chars_per_token(args.base_url, args.model, args.api_key, args.timeout)
+        if args.calibrate_tokenizer
+        else 4.0
+    )
 
     mem_pre = capture_mem(args.mem_pid)
     runs = []
     for _ in range(args.runs):
-        prompt = make_prompt(args.prompt_tokens, args.allow_cache)
+        prompt = make_prompt(args.prompt_tokens, args.allow_cache, chars_per_token=cpt)
         res = stream_chat_completion(
             args.base_url, args.model, prompt, args.max_tokens,
-            api_key=args.api_key, timeout=args.timeout
+            api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
         res.pop("output_text", None)
         runs.append(res)
@@ -302,6 +386,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         "base_url": args.base_url,
         "model": args.model,
         "prompt_tokens_target": args.prompt_tokens,
+        "chars_per_token": round(cpt, 3),
         "max_tokens": args.max_tokens,
         "summary": summarize_runs(runs),
         "runs": runs,
@@ -312,11 +397,77 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_screen(args: argparse.Namespace) -> int:
+    """Fast ~60s onboarding smoke test across prose, code, prefix-cache reuse, and greedy determinism (PR #24)."""
+    mem_pre = capture_mem(args.mem_pid)
+
+    prose = stream_chat_completion(
+        args.base_url, args.model, make_prompt(256, False), args.max_tokens,
+        temperature=0.0, api_key=args.api_key, timeout=args.timeout,
+        max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
+    )
+    code_prompt = (
+        f"[nonce-{random.randint(100000, 999999)}] Write a clean Python function that parses "
+        "a JSONL benchmark ledger and computes median and MAD per experiment label."
+    )
+    code = stream_chat_completion(
+        args.base_url, args.model, code_prompt, args.max_tokens,
+        temperature=0.0, api_key=args.api_key, timeout=args.timeout,
+        max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
+    )
+
+    shared_prefix = " ".join(make_heterogeneous_filler(2000, seed=42))
+    turn1 = stream_chat_completion(
+        args.base_url, args.model, shared_prefix + "\nQuestion: Summarize in one sentence.", 48,
+        temperature=0.0, api_key=args.api_key, timeout=args.timeout,
+        max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
+    )
+    turn2 = stream_chat_completion(
+        args.base_url, args.model, shared_prefix + "\nQuestion: List two subsystems mentioned.", 48,
+        temperature=0.0, api_key=args.api_key, timeout=args.timeout,
+        max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
+    )
+
+    greedy_prompt = "Reply with the exact first 5 prime numbers separated by commas."
+    g1 = stream_chat_completion(
+        args.base_url, args.model, greedy_prompt, 32, temperature=0.0,
+        api_key=args.api_key, timeout=args.timeout, min_decode_window_s=0.0,
+    )
+    g2 = stream_chat_completion(
+        args.base_url, args.model, greedy_prompt, 32, temperature=0.0,
+        api_key=args.api_key, timeout=args.timeout, min_decode_window_s=0.0,
+    )
+    greedy_deterministic = (g1["output_text"] == g2["output_text"]) and bool(g1["output_text"].strip())
+    mem_post = capture_mem(args.mem_pid)
+
+    record: dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "mode": "screen",
+        "label": args.label,
+        "base_url": args.base_url,
+        "model": args.model,
+        "prose_decode_tps": prose["decode_tps"],
+        "prose_flags": prose["flags"],
+        "code_decode_tps": code["decode_tps"],
+        "code_flags": code["flags"],
+        "prefix_turn1_ttft_s": turn1["ttft_s"],
+        "prefix_turn2_ttft_s": turn2["ttft_s"],
+        "prefix_cache_speedup": round(turn1["ttft_s"] / max(turn2["ttft_s"], 1e-6), 2),
+        "greedy_deterministic": greedy_deterministic,
+        "passed": (prose["valid"] and code["valid"] and greedy_deterministic),
+    }
+    attach_mem_delta(record, mem_pre, mem_post)
+    append_ledger(args.ledger, record)
+    print(json.dumps(record, indent=2))
+    return 0 if record["passed"] else 1
+
+
 def cmd_ab(args: argparse.Namespace) -> int:
     for url in (args.control_url, args.candidate_url):
         stream_chat_completion(
             url, args.model, make_prompt(128, False), min(32, args.max_tokens),
-            api_key=args.api_key, timeout=args.timeout
+            api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
 
     mem_pre = capture_mem(args.mem_pid)
@@ -327,15 +478,18 @@ def cmd_ab(args: argparse.Namespace) -> int:
     for _ in range(args.cycles):
         r1 = stream_chat_completion(
             args.control_url, args.model, make_prompt(args.prompt_tokens, args.allow_cache),
-            args.max_tokens, api_key=args.api_key, timeout=args.timeout
+            args.max_tokens, api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
         r2 = stream_chat_completion(
             args.candidate_url, args.model, make_prompt(args.prompt_tokens, args.allow_cache),
-            args.max_tokens, api_key=args.api_key, timeout=args.timeout
+            args.max_tokens, api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
         r3 = stream_chat_completion(
             args.control_url, args.model, make_prompt(args.prompt_tokens, args.allow_cache),
-            args.max_tokens, api_key=args.api_key, timeout=args.timeout
+            args.max_tokens, api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
         for r in (r1, r2, r3):
             r.pop("output_text", None)
@@ -345,10 +499,20 @@ def cmd_ab(args: argparse.Namespace) -> int:
     mem_post = capture_mem(args.mem_pid)
 
     _, direction = METRIC_SPECS[args.metric]
-    pre_med = statistics.median([r[args.metric] for r in ctl_pre])
-    cand_med = statistics.median([r[args.metric] for r in cand])
-    post_med = statistics.median([r[args.metric] for r in ctl_post])
-    scored = score_triad(pre_med, cand_med, post_med, direction, args.min_gain_pct)
+    v_pre = [r[args.metric] for r in ctl_pre if r["valid"] and r[args.metric] is not None]
+    v_cand = [r[args.metric] for r in cand if r["valid"] and r[args.metric] is not None]
+    v_post = [r[args.metric] for r in ctl_post if r["valid"] and r[args.metric] is not None]
+
+    if not (v_pre and v_cand and v_post):
+        scored = {"verdict": "INVALID_SAMPLES", "control_drift_pct": None, "gain_pct": None}
+    else:
+        scored = score_triad(
+            statistics.median(v_pre),
+            statistics.median(v_cand),
+            statistics.median(v_post),
+            direction,
+            args.min_gain_pct,
+        )
 
     record: dict[str, Any] = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -396,13 +560,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
     cand_rec = latest_by_label[args.candidate_label]
     post_rec = latest_by_label[args.control_post_label]
 
-    scored = score_triad(
-        float(pre_rec["summary"][summary_key]),
-        float(cand_rec["summary"][summary_key]),
-        float(post_rec["summary"][summary_key]),
-        direction,
-        args.min_gain_pct,
-    )
+    if cand_rec["summary"].get("valid_n", 1) == 0:
+        scored = {"verdict": "INVALID_SAMPLES", "control_drift_pct": None, "gain_pct": None}
+    else:
+        scored = score_triad(
+            float(pre_rec["summary"][summary_key]),
+            float(cand_rec["summary"][summary_key]),
+            float(post_rec["summary"][summary_key]),
+            direction,
+            args.min_gain_pct,
+        )
     record = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mode": "compare",
@@ -416,6 +583,66 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if not args.no_write:
         append_ledger(args.ledger, record)
     print(json.dumps(record, indent=2))
+    return 0
+
+
+def cmd_aa(args: argparse.Namespace) -> int:
+    """Measure empirical A/A noise floor across back-to-back unchanged runs (PR #11)."""
+    p = Path(args.ledger)
+    if not p.exists():
+        print(f"Error: ledger not found: {p}", file=sys.stderr)
+        return 2
+
+    vals: list[float] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("mode") != "baseline":
+            continue
+        if args.label and obj.get("label") != args.label:
+            continue
+        for r in obj.get("runs", []):
+            if r.get("valid", True) and r.get(args.metric) is not None:
+                vals.append(float(r[args.metric]))
+
+    if len(vals) < 3:
+        print(f"Error: need at least 3 valid samples for A/A noise floor (found {len(vals)}).", file=sys.stderr)
+        return 2
+
+    _, direction = METRIC_SPECS[args.metric]
+    triads = len(vals) - 2
+    false_wins = 0
+    max_false_win_pct = 0.0
+
+    for i in range(1, len(vals) - 1):
+        prev_v, mid_v, next_v = vals[i - 1], vals[i], vals[i + 1]
+        if direction == "higher":
+            better_nbr = max(prev_v, next_v)
+            if mid_v > better_nbr:
+                false_wins += 1
+                pct = (mid_v - better_nbr) / max(better_nbr, 1e-9) * 100.0
+                max_false_win_pct = max(max_false_win_pct, pct)
+        else:
+            better_nbr = min(prev_v, next_v)
+            if mid_v < better_nbr:
+                false_wins += 1
+                pct = (better_nbr - mid_v) / max(better_nbr, 1e-9) * 100.0
+                max_false_win_pct = max(max_false_win_pct, pct)
+
+    suggested_floor = round(max(2.0, max_false_win_pct * 1.25), 2)
+    out = {
+        "mode": "aa_noise_floor",
+        "metric": args.metric,
+        "samples": len(vals),
+        "triads_checked": triads,
+        "false_wins": false_wins,
+        "false_win_rate_pct": round(false_wins / triads * 100.0, 1),
+        "max_no_change_win_pct": round(max_false_win_pct, 2),
+        "recommended_min_gain_pct": suggested_floor,
+    }
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -437,6 +664,8 @@ def cmd_concurrency(args: argparse.Namespace) -> int:
                     0.0,
                     args.api_key,
                     args.timeout,
+                    args.max_plausible_tps,
+                    args.min_decode_window_s,
                 )
                 for _ in range(level)
             ]
@@ -448,16 +677,18 @@ def cmd_concurrency(args: argparse.Namespace) -> int:
                 except Exception:
                     errors += 1
         wall_s = max(time.perf_counter() - t0, 1e-9)
-        total_out_tokens = sum(r["completion_tokens"] or 0 for r in worker_runs)
+        valid_runs = [r for r in worker_runs if r["valid"] and r["decode_tps"] is not None]
+        total_out_tokens = sum(r["completion_tokens"] or 0 for r in valid_runs)
         results.append(
             {
                 "concurrency": level,
                 "errors": errors,
+                "flagged_samples": len(worker_runs) - len(valid_runs),
                 "wall_s": round(wall_s, 3),
                 "aggregate_decode_tps": round(total_out_tokens / wall_s, 3),
                 "per_stream_median_tps": round(
-                    statistics.median([r["decode_tps"] for r in worker_runs]), 3
-                ) if worker_runs else 0.0,
+                    statistics.median([r["decode_tps"] for r in valid_runs]), 3
+                ) if valid_runs else 0.0,
                 "ttft_p95_s": round(
                     percentile([r["ttft_s"] for r in worker_runs], 95), 4
                 ) if worker_runs else 0.0,
@@ -488,15 +719,17 @@ def cmd_soak(args: argparse.Namespace) -> int:
     while (time.perf_counter() - t_start) < args.duration_s or len(samples) < args.min_runs:
         res = stream_chat_completion(
             args.base_url, args.model, make_prompt(args.prompt_tokens, False),
-            args.max_tokens, api_key=args.api_key, timeout=args.timeout
+            args.max_tokens, api_key=args.api_key, timeout=args.timeout,
+            max_plausible_tps=args.max_plausible_tps, min_decode_window_s=args.min_decode_window_s,
         )
-        samples.append(
-            {
-                "elapsed_s": round(time.perf_counter() - t_start, 2),
-                "decode_tps": res["decode_tps"],
-                "ttft_s": res["ttft_s"],
-            }
-        )
+        if res["valid"] and res["decode_tps"] is not None:
+            samples.append(
+                {
+                    "elapsed_s": round(time.perf_counter() - t_start, 2),
+                    "decode_tps": res["decode_tps"],
+                    "ttft_s": res["ttft_s"],
+                }
+            )
         if (time.perf_counter() - t_start) >= args.duration_s and len(samples) >= args.min_runs:
             break
 
@@ -529,7 +762,12 @@ def cmd_soak(args: argparse.Namespace) -> int:
 
 
 def cmd_needle(args: argparse.Namespace) -> int:
-    target_chars = max(512, int(args.target_tokens * 4))
+    cpt = (
+        4.0
+        if args.no_calibrate_tokenizer
+        else calibrate_chars_per_token(args.base_url, args.model, args.api_key, args.timeout)
+    )
+    target_chars = max(512, int(args.target_tokens * cpt))
     checks = []
     all_passed = True
     mem_pre = capture_mem(args.mem_pid)
@@ -547,7 +785,7 @@ def cmd_needle(args: argparse.Namespace) -> int:
         )
         res = stream_chat_completion(
             args.base_url, args.model, prompt, max_tokens=args.max_tokens, temperature=0.0,
-            api_key=args.api_key, timeout=args.timeout
+            api_key=args.api_key, timeout=args.timeout, min_decode_window_s=0.0,
         )
         passed = code in res["output_text"]
         if not passed:
@@ -557,6 +795,7 @@ def cmd_needle(args: argparse.Namespace) -> int:
                 "depth": depth,
                 "expected": code,
                 "passed": passed,
+                "prompt_tokens": res["prompt_tokens"],
                 "ttft_s": res["ttft_s"],
                 "prefill_tps": res["prefill_tps"],
                 "response_excerpt": res["output_text"][:160],
@@ -571,6 +810,7 @@ def cmd_needle(args: argparse.Namespace) -> int:
         "base_url": args.base_url,
         "model": args.model,
         "target_tokens": args.target_tokens,
+        "chars_per_token": round(cpt, 3),
         "all_passed": all_passed,
         "checks": checks,
     }
@@ -591,6 +831,8 @@ def main() -> int:
         p.add_argument("--api-key", default="EMPTY", help="Bearer API key if required")
         p.add_argument("--timeout", type=float, default=300.0, help="HTTP request timeout in seconds")
         p.add_argument("--mem-pid", type=int, help="Optional server PID for pre/post macOS memory & thermal telemetry")
+        p.add_argument("--max-plausible-tps", type=float, default=DEFAULT_MAX_PLAUSIBLE_TPS)
+        p.add_argument("--min-decode-window-s", type=float, default=MIN_DECODE_WINDOW_S)
         p.add_argument("--ledger", help="Optional path to append-only ledger.jsonl")
 
     p_base = sub.add_parser("baseline", help="Measure single-server baseline")
@@ -601,7 +843,14 @@ def main() -> int:
     p_base.add_argument("--prompt-tokens", type=int, default=512)
     p_base.add_argument("--max-tokens", type=int, default=256)
     p_base.add_argument("--allow-cache", action="store_true")
+    p_base.add_argument("--calibrate-tokenizer", action="store_true")
     p_base.set_defaults(func=cmd_baseline)
+
+    p_scr = sub.add_parser("screen", help="Fast ~60s onboarding smoke test for engine bake-offs")
+    add_common(p_scr)
+    p_scr.add_argument("--base-url", required=True)
+    p_scr.add_argument("--max-tokens", type=int, default=128)
+    p_scr.set_defaults(func=cmd_screen)
 
     p_ab = sub.add_parser("ab", help="Dual-server interleaved control -> candidate -> control A/B test")
     add_common(p_ab)
@@ -625,6 +874,12 @@ def main() -> int:
     p_cmp.add_argument("--label", default="")
     p_cmp.add_argument("--no-write", action="store_true", help="Do not append comparison result back to ledger")
     p_cmp.set_defaults(func=cmd_compare)
+
+    p_aa = sub.add_parser("aa", help="Compute empirical A/A noise floor from unchanged baseline runs")
+    p_aa.add_argument("--ledger", required=True)
+    p_aa.add_argument("--label", default="", help="Optional baseline label filter")
+    p_aa.add_argument("--metric", choices=list(METRIC_SPECS.keys()), default="decode_tps")
+    p_aa.set_defaults(func=cmd_aa)
 
     p_conc = sub.add_parser("concurrency", help="Sweep concurrent client load")
     add_common(p_conc)
@@ -651,6 +906,7 @@ def main() -> int:
     p_needle.add_argument("--target-tokens", type=int, default=8192)
     p_needle.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5, 0.9])
     p_needle.add_argument("--max-tokens", type=int, default=512)
+    p_needle.add_argument("--no-calibrate-tokenizer", action="store_true")
     p_needle.set_defaults(func=cmd_needle)
 
     args = parser.parse_args()

@@ -2,6 +2,16 @@
 
 Calculate hardware ceilings before tuning any server flag. On Apple Silicon unified memory, single-stream token generation (decode) is almost always memory-bandwidth bound, while prompt processing (prefill) and high-batch serving transition toward GPU compute (and M5+ Neural Accelerator) limits.
 
+## Measuring Real Bandwidth vs. Spec-Sheet Bandwidth
+
+Apple publishes theoretical peak bus bandwidth in decimal GB/s (`1e9 bytes/s`). Sustained GPU copy bandwidth is typically 80-92% of spec peak. Run the bundled native Swift/Metal probe on your Mac to measure real sustained unified-memory bandwidth directly:
+
+```bash
+swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
+```
+
+Pass the reported `measured_bw_median_gbs` to `scripts/ceiling.py --bw-gbs` for the most accurate ceiling, or use the M1-M6 spec-sheet presets below as a starting point.
+
 ## Apple Silicon Memory Bandwidth Reference (M1 through M6)
 
 | Chip | GPU Cores | Peak Memory Bandwidth | Max Unified RAM | Notes |
@@ -33,23 +43,25 @@ Calculate hardware ceilings before tuning any server flag. On Apple Silicon unif
 
 Important nuance: Always verify the exact GPU core bin (`system_profiler SPDisplaysDataType`) on M3 Max, M4 Max, and M5 Max Macs, because the lower GPU core bin ships with a narrower memory bus (300 vs 400, 410 vs 546, and 460 vs 614 GB/s respectively).
 
-## Decode Ceiling Math (Single-Stream)
+## Decode Ceiling Math (Single-Stream and Concurrent)
 
-During autoregressive decode at batch size 1, generating one token requires streaming every active weight plus the active KV cache for that sequence from unified memory into the GPU. Note that Apple publishes memory bandwidth in decimal GB/s (`1e9 bytes/s`), while macOS `hw.memsize` and `vm_stat` report binary GiB (`1024^3 bytes`). `scripts/ceiling.py` accounts for both units consistently.
+During autoregressive decode at batch size 1, generating one token streams every active weight (multiplied by looped layer visits, if applicable) plus the active KV cache from unified memory into the GPU. At concurrency `N`, shared dense weights and draft-model weights are read **once per batched engine step**, while KV cache is read `N` times (once per stream).
 
 ```text
-active_weight_bytes = active_params * (effective_bits_per_param / 8)
+active_weight_bytes = active_params * loop_multiplier * (effective_bits_per_param / 8)
 kv_read_bytes_per_step = kv_bytes_per_token * current_context_tokens
 total_bytes_per_token = active_weight_bytes + kv_read_bytes_per_step
 
-theoretical_decode_tps = peak_bandwidth_bytes_per_sec / total_bytes_per_token
-realistic_dense_tps    = 0.70 to 0.85 * theoretical_decode_tps
-realistic_moe_tps      = 0.55 to 0.72 * theoretical_decode_tps
+theoretical_decode_tps     = peak_bandwidth_bytes_per_sec / total_bytes_per_token
+theoretical_agg_tps_conc_N = (peak_bandwidth_bytes_per_sec / (active_weight_bytes + N * kv_read_bytes_per_step)) * N
+realistic_dense_tps        = 0.70 to 0.85 * theoretical_decode_tps
+realistic_moe_tps          = 0.55 to 0.72 * theoretical_decode_tps
 ```
 
 Key implications:
 
-- **MoE models**: Use `active_params` (for example, 3B active out of 35B total) for decode bandwidth math, but use `total_params` for unified-memory residency math. Sparse MoE models incur higher fixed per-token dispatch overhead (router, norms, expert gather/scatter), so realized bandwidth efficiency is typically 55-72% rather than 70-85%.
+- **Looped models (count layer visits, not physical layers)**: A looped architecture like Inkling-2-Mini (24 physical layers whose 12-layer core executes 3 times = 48 layer visits) reads dense and expert weights roughly 2x per token. Pass `--loop-multiplier 2.0` to `ceiling.py` or your theoretical ceiling will overstate headroom by 2x.
+- **MoE models**: Use `active_params` (for example, 3B active out of 35B total) for decode bandwidth math, and `total_params` for unified-memory residency math. Sparse MoE models incur higher per-token dispatch overhead (router, norms, expert gather/scatter), so realized bandwidth efficiency is typically 55-72% rather than 70-85%.
 - **Effective bits per parameter**: A nominal "4-bit" quant is rarely 4.00 bits/param once scales, zero-points, and unquantized embeddings/lm_head are included. Prefer actual weight file size on disk (`--file-gb`) when available, or estimate 4.5-4.8 bits for Q4_K_M / MLX 4-bit-g64, 5.5-5.8 bits for Q5_K_M, and 8.5 bits for Q8_0 / MLX 8-bit.
 - **KV-crossover context**: Compute `kv_crossover_ctx = active_weight_bytes / kv_bytes_per_token`. Above ~25% of `kv_crossover_ctx`, KV reads meaningfully drag down decode speed and KV quantization becomes a throughput lever (not just a RAM-saving lever). Below ~10% of `kv_crossover_ctx`, KV quantization rarely speeds up decode and can regress it due to dequantization overhead.
 
@@ -91,12 +103,3 @@ Practical safety thresholds:
 - **macOS default wired limit**: Typically ~66-75% of physical RAM depending on memory tier.
 - **Safe raised `iogpu.wired_limit_mb`**: Up to 75-80% of physical RAM on 32-64 GB Macs, or leaving 16-32 GB unwired for macOS on 128-512 GB Macs.
 - **Danger zone**: When `total_model_footprint` approaches or exceeds `iogpu.wired_limit_mb`, Metal either fails allocation or forces macOS into heavy memory compression and SSD swap, collapsing decode throughput by 5x-50x.
-
-## Interpreting Efficiency (% of Ceiling)
-
-After measuring baseline decode speed, compute `efficiency = observed_tps / theoretical_decode_tps`:
-
-- **< 50% of ceiling**: Major bottleneck present (CPU fallback, swap/compression, missing Flash Attention, `mx.compile` retracing, stuck headless GPU clock, or broken tensor layout). Investigate before tuning minor flags.
-- **50-70% of ceiling**: Meaningful headroom remains for dense models (or healthy range for sparse MoE). Look at runtime selection (MLX vs llama.cpp Metal), quantization kernel alignment, KV layout, or kernel fusion (`mx.fast.*` / `mx.fast.metal_kernel`).
-- **70-85% of ceiling**: Healthy Apple Silicon utilization for single-stream dense decode. Further gains require reducing bytes moved per token (quantization, MoE, speculative decoding where bandwidth permits) or shifting focus to TTFT/prefill and concurrency.
-- **> 95% of ceiling (or > 100%)**: Measurement bug! Check for prompt-cache hit cheating, wrong active-parameter count, client-side token counting error, or compressed/dummy output.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# macOS-safe single-GPU benchmark serializer using POSIX atomic mkdir locking.
-# Replaces Linux-only flock so overlapping agent commands never share unified GPU bandwidth.
-# Uses atomic rename before stale-lock cleanup to prevent race conditions between waiters.
+# Portable single-GPU benchmark serializer for macOS and Linux.
+# Uses Python's fcntl.flock inside a private per-user 0700 directory with O_NOFOLLOW
+# and ownership checks, so locks release automatically on crash/SIGKILL without stale-lock races.
 #
 # Usage:
 #   bash scripts/queue.sh <job-label> -- <command...>
-#   QUEUE_LOCK_DIR=/tmp/my_gpu.lock QUEUE_TIMEOUT=600 bash scripts/queue.sh ab-1 -- python3 ...
+#   QUEUE_LOCK=/path/to/custom.lock bash scripts/queue.sh ab-1 -- python3 ...
 
 set -euo pipefail
 
@@ -22,56 +22,57 @@ if [[ "$1" != "--" ]]; then
 fi
 shift
 
-LOCK_DIR="${QUEUE_LOCK_DIR:-/tmp/apple_silicon_inference_gpu.lock}"
-TIMEOUT="${QUEUE_TIMEOUT:-1800}"
-POLL_INTERVAL="${QUEUE_POLL_INTERVAL:-1}"
-PID_FILE="$LOCK_DIR/pid"
-LABEL_FILE="$LOCK_DIR/label"
+exec python3 - "$LABEL" "$@" <<'PY'
+import fcntl
+import os
+import stat
+import subprocess
+import sys
+import tempfile
 
-acquire_lock() {
-  local start_ts now_ts elapsed holder_pid holder_label stale_dir
-  start_ts="$(date +%s)"
+label = sys.argv[1]
+cmd = sys.argv[2:]
+uid = os.getuid()
+custom = os.environ.get("QUEUE_LOCK")
 
-  while true; do
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-      echo "$$" > "$PID_FILE"
-      echo "$LABEL" > "$LABEL_FILE"
-      return 0
-    fi
+if custom:
+    lock_path = os.path.abspath(custom)
+    parent = os.path.dirname(lock_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+else:
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+        tempfile.gettempdir(), f"inference-optimisation-macos-{uid}"
+    )
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        st = os.stat(base, follow_symlinks=False)
+    except OSError as exc:
+        sys.exit(f"[queue] cannot create private lock directory {base}: {exc}")
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or (stat.S_IMODE(st.st_mode) & 0o077):
+        sys.exit(f"[queue] lock directory must be private (0700) and owned by uid {uid}: {base}")
+    lock_path = os.path.join(base, "gpu.lock")
 
-    # Recover stale lock atomically via rename so concurrent waiters cannot delete a fresh lock
-    if [[ -f "$PID_FILE" ]]; then
-      holder_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-      if [[ -n "$holder_pid" ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
-        stale_dir="${LOCK_DIR}.stale.$$"
-        if mv "$LOCK_DIR" "$stale_dir" 2>/dev/null; then
-          echo "[queue] Reaped stale lock from dead PID $holder_pid" >&2
-          rm -rf "$stale_dir" 2>/dev/null || true
-          continue
-        fi
-      fi
-    fi
+flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+try:
+    fd = os.open(lock_path, flags, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+        os.close(fd)
+        sys.exit(f"[queue] refusing non-regular or foreign-owned lock file: {lock_path}")
+except OSError as exc:
+    sys.exit(f"[queue] failed to open lock file {lock_path}: {exc}")
 
-    now_ts="$(date +%s)"
-    elapsed=$((now_ts - start_ts))
-    if [[ "$elapsed" -ge "$TIMEOUT" ]]; then
-      holder_label="$(cat "$LABEL_FILE" 2>/dev/null || echo unknown)"
-      echo "[queue] Timed out after ${TIMEOUT}s waiting for GPU lock (held by '$holder_label')" >&2
-      return 1
-    fi
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, f"{os.getpid()} {label}\n".encode("utf-8"))
+sys.stderr.write(f"[queue] Acquired GPU lock for '{label}' (pid={os.getpid()})\n")
+sys.stderr.flush()
 
-    sleep "$POLL_INTERVAL"
-  done
-}
+try:
+    rc = subprocess.call(cmd)
+finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
-release_lock() {
-  if [[ -f "$PID_FILE" ]] && [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
-  fi
-}
-
-trap release_lock EXIT INT TERM
-
-acquire_lock
-echo "[queue] Acquired GPU lock for '$LABEL' (pid=$$)" >&2
-"$@"
+sys.exit(rc)
+PY

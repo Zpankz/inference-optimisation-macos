@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS-native unified memory, Metal wired-limit, memory pressure, swap, and thermal telemetry."""
+"""macOS-native unified memory, Metal IOAccelerator, wired-limit, memory pressure, swap, and thermal telemetry."""
 
 import argparse
 import json
@@ -65,6 +65,22 @@ def parse_memory_pressure(text: str) -> dict[str, Any]:
     m = re.search(r"free percentage:\s*(\d+)%", text, re.IGNORECASE)
     free_pct = int(m.group(1)) if m else None
     return {"system_free_pct": free_pct}
+
+
+def parse_ioaccelerator(text: str) -> dict[str, float | None]:
+    """Parse passwordless Metal GPU memory residency from `ioreg -r -c IOAccelerator`."""
+    in_use = None
+    alloc = None
+    m_in = re.search(r'"In use system memory"\s*=\s*(\d+)', text)
+    if m_in:
+        in_use = round(int(m_in.group(1)) / (1024**3), 3)
+    m_al = re.search(r'"Alloc system memory"\s*=\s*(\d+)', text)
+    if m_al:
+        alloc = round(int(m_al.group(1)) / (1024**3), 3)
+    return {
+        "gpu_in_use_gib": in_use,
+        "gpu_alloc_gib": alloc,
+    }
 
 
 def parse_thermal(text: str) -> dict[str, Any]:
@@ -148,9 +164,10 @@ def collect_snapshot(pid: int | None = None) -> dict[str, Any]:
         snap["vm_stat"] = parse_vm_stat(run_cmd(["vm_stat"]))
         snap["swap"] = parse_swapusage(run_cmd(["sysctl", "-n", "vm.swapusage"]))
         snap["memory_pressure"] = parse_memory_pressure(run_cmd(["memory_pressure", "-Q"]))
+        snap["metal_gpu"] = parse_ioaccelerator(run_cmd(["ioreg", "-r", "-c", "IOAccelerator"]))
         snap["thermal"] = parse_thermal(run_cmd(["pmset", "-g", "therm"]))
     else:
-        snap["note"] = "Non-macOS host; macOS sysctl/vm_stat/pmset metrics unavailable."
+        snap["note"] = "Non-macOS host; macOS sysctl/vm_stat/ioreg/pmset metrics unavailable."
 
     if pid is not None:
         snap["process"] = sample_process(pid)
@@ -176,6 +193,8 @@ def diff_snapshots(pre: dict[str, Any], post: dict[str, Any]) -> dict[str, Any]:
         delta["swap_delta_gib"] = round(
             post["swap"].get("swap_used_gib", 0.0) - pre["swap"].get("swap_used_gib", 0.0), 3
         )
+    if "metal_gpu" in post and post["metal_gpu"].get("gpu_in_use_gib") is not None:
+        delta["gpu_in_use_post_gib"] = post["metal_gpu"]["gpu_in_use_gib"]
     if "memory_pressure" in post:
         delta["system_free_pct_post"] = post["memory_pressure"].get("system_free_pct")
     if "thermal" in post:
@@ -208,10 +227,11 @@ def main() -> int:
                 vs = snap["vm_stat"]
                 sw = snap.get("swap", {})
                 mp = snap.get("memory_pressure", {})
+                mg = snap.get("metal_gpu", {})
                 print(
                     f"  vm_stat: wired={vs['wired_gib']}GiB active={vs['active_gib']}GiB "
                     f"compressed={vs['compressed_gib']}GiB swap_used={sw.get('swap_used_gib', 0)}GiB "
-                    f"free_pct={mp.get('system_free_pct')}%"
+                    f"free_pct={mp.get('system_free_pct')}% gpu_in_use={mg.get('gpu_in_use_gib')}GiB"
                 )
             if "process" in snap:
                 pr = snap["process"]

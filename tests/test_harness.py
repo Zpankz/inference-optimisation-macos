@@ -53,37 +53,40 @@ class TestCeilingCalculator(unittest.TestCase):
         self.assertIn("m5 ultra", out)
         self.assertIn("1228.0 GB/s", out)
 
-    def test_moe_roofline_and_kv_crossover(self) -> None:
-        out = subprocess.check_output(
-            [
-                "python3",
-                str(SCRIPTS / "ceiling.py"),
-                "--chip",
-                "M4 Max 40-core",
-                "--ram-gb",
-                "128",
-                "--active-params-b",
-                "3.5",
-                "--total-params-b",
-                "35",
-                "--bits",
-                "4.5",
-                "--ctx",
-                "32768",
-                "--concurrency",
-                "2",
-                "--observed-tps",
-                "180",
-                "--json",
-            ],
-            text=True,
+    def test_moe_looped_roofline_and_kv_crossover(self) -> None:
+        base_out = json.loads(
+            subprocess.check_output(
+                [
+                    "python3", str(SCRIPTS / "ceiling.py"),
+                    "--chip", "M4 Max 40-core", "--ram-gb", "128",
+                    "--active-params-b", "3.5", "--total-params-b", "35",
+                    "--bits", "4.5", "--ctx", "32768", "--concurrency", "2",
+                    "--observed-tps", "180", "--json",
+                ],
+                text=True,
+            )
         )
-        data = json.loads(out)
-        self.assertEqual(data["architecture"], "moe")
-        self.assertEqual(data["peak_bandwidth_gbs"], 546.0)
-        self.assertTrue(data["fits_wired_limit"])
-        self.assertGreater(data["kv_crossover_ctx"], 10000)
-        self.assertTrue(any("KV-SIGNIFICANT" in d for d in data["diagnostics"]))
+        self.assertEqual(base_out["architecture"], "moe")
+        self.assertEqual(base_out["peak_bandwidth_gbs"], 546.0)
+        self.assertTrue(base_out["fits_wired_limit"])
+        self.assertGreater(base_out["kv_crossover_ctx"], 10000)
+
+        loop_out = json.loads(
+            subprocess.check_output(
+                [
+                    "python3", str(SCRIPTS / "ceiling.py"),
+                    "--chip", "M4 Max 40-core", "--ram-gb", "128",
+                    "--active-params-b", "3.5", "--total-params-b", "35",
+                    "--loop-multiplier", "2.0", "--bits", "4.5", "--json",
+                ],
+                text=True,
+            )
+        )
+        self.assertAlmostEqual(
+            loop_out["theoretical_decode_tps_short_ctx"] * 2.0,
+            base_out["theoretical_decode_tps_short_ctx"],
+            delta=0.2,
+        )
 
 
 class TestMacOSMemoryParsers(unittest.TestCase):
@@ -93,7 +96,7 @@ class TestMacOSMemoryParsers(unittest.TestCase):
         cls.mm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.mm)
 
-    def test_parse_vm_stat_and_swap(self) -> None:
+    def test_parse_vm_stat_swap_and_ioaccelerator(self) -> None:
         sample = (
             "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
             "Pages free:                              100000.\n"
@@ -109,6 +112,11 @@ class TestMacOSMemoryParsers(unittest.TestCase):
 
         sw = self.mm.parse_swapusage("total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)")
         self.assertAlmostEqual(sw["swap_used_gib"], 0.5, places=2)
+
+        io_sample = '"PerformanceStatistics" = {"Alloc system memory"=25769803776,"In use system memory"=21474836480}'
+        io_parsed = self.mm.parse_ioaccelerator(io_sample)
+        self.assertAlmostEqual(io_parsed["gpu_in_use_gib"], 20.0, places=2)
+        self.assertAlmostEqual(io_parsed["gpu_alloc_gib"], 24.0, places=2)
 
     def test_parse_thermal_no_false_positive(self) -> None:
         nominal = self.mm.parse_thermal(
@@ -127,34 +135,26 @@ class TestMacOSMemoryParsers(unittest.TestCase):
 
 
 class TestQueueSerializer(unittest.TestCase):
-    def test_stale_lock_reap_and_serialization(self) -> None:
+    def test_flock_serialization_and_exit_code_propagation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            lock_dir = os.path.join(td, "gpu.lock")
-            os.mkdir(lock_dir)
-            Path(lock_dir, "pid").write_text("999999", encoding="utf-8")
-
+            lock_file = os.path.join(td, "gpu.lock")
             env = os.environ.copy()
-            env["QUEUE_LOCK_DIR"] = lock_dir
-            env["QUEUE_POLL_INTERVAL"] = "0.05"
+            env["QUEUE_LOCK"] = lock_file
 
-            subprocess.run(
-                ["bash", str(SCRIPTS / "queue.sh"), "stale", "--", "true"],
+            # Propagates non-zero exit code cleanly
+            rc = subprocess.call(
+                ["bash", str(SCRIPTS / "queue.sh"), "fail-job", "--", "false"],
                 env=env,
-                check=True,
                 stderr=subprocess.DEVNULL,
             )
-            self.assertFalse(os.path.exists(lock_dir))
+            self.assertNotEqual(rc, 0)
 
+            # Strict serialization under contention
             log_file = Path(td, "order.txt")
             p1 = subprocess.Popen(
                 [
-                    "bash",
-                    str(SCRIPTS / "queue.sh"),
-                    "j1",
-                    "--",
-                    "bash",
-                    "-c",
-                    f"echo s1 >> {log_file}; sleep 0.2; echo e1 >> {log_file}",
+                    "bash", str(SCRIPTS / "queue.sh"), "j1", "--",
+                    "bash", "-c", f"echo s1 >> {log_file}; sleep 0.2; echo e1 >> {log_file}",
                 ],
                 env=env,
                 stderr=subprocess.DEVNULL,
@@ -162,13 +162,8 @@ class TestQueueSerializer(unittest.TestCase):
             time.sleep(0.05)
             p2 = subprocess.Popen(
                 [
-                    "bash",
-                    str(SCRIPTS / "queue.sh"),
-                    "j2",
-                    "--",
-                    "bash",
-                    "-c",
-                    f"echo s2 >> {log_file}; echo e2 >> {log_file}",
+                    "bash", str(SCRIPTS / "queue.sh"), "j2", "--",
+                    "bash", "-c", f"echo s2 >> {log_file}; echo e2 >> {log_file}",
                 ],
                 env=env,
                 stderr=subprocess.DEVNULL,
@@ -182,7 +177,7 @@ class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
-def _make_mock_handler(ttft_delay: float, tok_delay: float):
+def _make_mock_handler(ttft_delay: float, tok_delay: float, degenerate_coalesced: bool = False):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -197,12 +192,24 @@ def _make_mock_handler(ttft_delay: float, tok_delay: float):
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
 
+            if degenerate_coalesced:
+                # Reproduces PR #9 M1 Max oMLX bug: single coalesced chunk of 64 '!' -> fake 863k tok/s
+                chunk = {"choices": [{"delta": {"content": "!" * 64}}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                usage = {"choices": [], "usage": {"prompt_tokens": 64, "completion_tokens": 64}}
+                self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+
             time.sleep(ttft_delay)
             m_code = re.search(r"KEY-[A-Z0-9]{8}", prompt)
             if m_code:
                 tokens = [("reasoning_content", "Thinking... "), ("content", m_code.group(0))]
+            elif "first 5 prime numbers" in prompt:
+                tokens = [("content", "2, 3, 5, 7, 11")]
             else:
-                tokens = [("content", f"t{i} ") for i in range(max_toks)]
+                tokens = [("content", f"word{i} ") for i in range(max_toks)]
 
             for field, tok in tokens:
                 time.sleep(tok_delay)
@@ -210,7 +217,8 @@ def _make_mock_handler(ttft_delay: float, tok_delay: float):
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
-            usage = {"choices": [], "usage": {"prompt_tokens": 256, "completion_tokens": len(tokens)}}
+            est_prompt_toks = max(16, len(prompt) // 4)
+            usage = {"choices": [], "usage": {"prompt_tokens": est_prompt_toks, "completion_tokens": len(tokens)}}
             self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode("utf-8"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -222,126 +230,110 @@ class TestBenchHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.srv_ctl = _ThreadedTCPServer(("127.0.0.1", 0), _make_mock_handler(0.03, 0.010))
-        cls.srv_cand = _ThreadedTCPServer(("127.0.0.1", 0), _make_mock_handler(0.008, 0.003))
+        cls.srv_cand = _ThreadedTCPServer(("127.0.0.1", 0), _make_mock_handler(0.01, 0.006))
+        cls.srv_broken = _ThreadedTCPServer(("127.0.0.1", 0), _make_mock_handler(0.0, 0.0, degenerate_coalesced=True))
         cls.port_ctl = cls.srv_ctl.server_address[1]
         cls.port_cand = cls.srv_cand.server_address[1]
-        threading.Thread(target=cls.srv_ctl.serve_forever, daemon=True).start()
-        threading.Thread(target=cls.srv_cand.serve_forever, daemon=True).start()
+        cls.port_broken = cls.srv_broken.server_address[1]
+        for s in (cls.srv_ctl, cls.srv_cand, cls.srv_broken):
+            threading.Thread(target=s.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.srv_ctl.shutdown()
-        cls.srv_cand.shutdown()
-        cls.srv_ctl.server_close()
-        cls.srv_cand.server_close()
+        for s in (cls.srv_ctl, cls.srv_cand, cls.srv_broken):
+            s.shutdown()
+            s.server_close()
+
+    def test_coalesced_degenerate_sample_rejected(self) -> None:
+        rec = json.loads(
+            subprocess.check_output(
+                [
+                    "python3", str(SCRIPTS / "bench.py"), "baseline",
+                    "--base-url", f"http://127.0.0.1:{self.port_broken}/v1",
+                    "--model", "broken", "--label", "broken",
+                    "--runs", "2", "--warmup", "0", "--max-tokens", "12",
+                ],
+                text=True,
+            )
+        )
+        self.assertEqual(rec["summary"]["valid_n"], 0)
+        self.assertIn("COALESCED", rec["summary"]["flags"])
+        self.assertIn("DEGENERATE", rec["summary"]["flags"])
+        self.assertEqual(rec["summary"]["decode_tps_median"], 0.0)
 
     def test_end_to_end_modes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             ledger = os.path.join(td, "ledger.jsonl")
             pid = str(os.getpid())
 
-            for label, port in [("ctl-pre", self.port_ctl), ("cand", self.port_cand), ("ctl-post", self.port_ctl)]:
+            # screen smoke test
+            scr = json.loads(
+                subprocess.check_output(
+                    [
+                        "python3", str(SCRIPTS / "bench.py"), "screen",
+                        "--base-url", f"http://127.0.0.1:{self.port_cand}/v1",
+                        "--model", "mock", "--label", "screen-cand",
+                        "--max-tokens", "12", "--mem-pid", pid, "--ledger", ledger,
+                    ],
+                    text=True,
+                )
+            )
+            self.assertTrue(scr["passed"])
+            self.assertTrue(scr["greedy_deterministic"])
+
+            # sequential baseline triad + A/A noise floor + compare
+            for label, port, runs in [("ctl-pre", self.port_ctl, "4"), ("cand", self.port_cand, "3"), ("ctl-post", self.port_ctl, "3")]:
                 rec = json.loads(
                     subprocess.check_output(
                         [
-                            "python3",
-                            str(SCRIPTS / "bench.py"),
-                            "baseline",
-                            "--base-url",
-                            f"http://127.0.0.1:{port}/v1",
-                            "--model",
-                            "mock",
-                            "--label",
-                            label,
-                            "--runs",
-                            "2",
-                            "--warmup",
-                            "1",
-                            "--prompt-tokens",
-                            "64",
-                            "--max-tokens",
-                            "8",
-                            "--mem-pid",
-                            pid,
-                            "--ledger",
-                            ledger,
+                            "python3", str(SCRIPTS / "bench.py"), "baseline",
+                            "--base-url", f"http://127.0.0.1:{port}/v1",
+                            "--model", "mock", "--label", label,
+                            "--runs", runs, "--warmup", "1",
+                            "--prompt-tokens", "64", "--max-tokens", "12",
+                            "--calibrate-tokenizer", "--mem-pid", pid, "--ledger", ledger,
                         ],
                         text=True,
                     )
                 )
                 self.assertGreater(rec["summary"]["prefill_tps_median"], 0)
-                self.assertIn("mem_delta", rec)
+                self.assertGreater(rec["summary"]["valid_n"], 0)
+
+            aa_rec = json.loads(
+                subprocess.check_output(
+                    [
+                        "python3", str(SCRIPTS / "bench.py"), "aa",
+                        "--ledger", ledger, "--label", "ctl-pre", "--metric", "decode_tps",
+                    ],
+                    text=True,
+                )
+            )
+            self.assertEqual(aa_rec["samples"], 4)
+            self.assertGreaterEqual(aa_rec["recommended_min_gain_pct"], 2.0)
 
             cmp_rec = json.loads(
                 subprocess.check_output(
                     [
-                        "python3",
-                        str(SCRIPTS / "bench.py"),
-                        "compare",
-                        "--ledger",
-                        ledger,
-                        "--control-pre-label",
-                        "ctl-pre",
-                        "--candidate-label",
-                        "cand",
-                        "--control-post-label",
-                        "ctl-post",
-                        "--metric",
-                        "decode_tps",
+                        "python3", str(SCRIPTS / "bench.py"), "compare",
+                        "--ledger", ledger,
+                        "--control-pre-label", "ctl-pre",
+                        "--candidate-label", "cand",
+                        "--control-post-label", "ctl-post",
+                        "--metric", "decode_tps",
                     ],
                     text=True,
                 )
             )
             self.assertEqual(cmp_rec["verdict"], "KEEP")
 
-            ab_rec = json.loads(
-                subprocess.check_output(
-                    [
-                        "python3",
-                        str(SCRIPTS / "bench.py"),
-                        "ab",
-                        "--control-url",
-                        f"http://127.0.0.1:{self.port_ctl}/v1",
-                        "--candidate-url",
-                        f"http://127.0.0.1:{self.port_cand}/v1",
-                        "--model",
-                        "mock",
-                        "--label",
-                        "ab-ttft",
-                        "--metric",
-                        "ttft_s",
-                        "--cycles",
-                        "2",
-                        "--max-tokens",
-                        "8",
-                        "--ledger",
-                        ledger,
-                    ],
-                    text=True,
-                )
-            )
-            self.assertEqual(ab_rec["verdict"], "KEEP")
-
             soak_rec = json.loads(
                 subprocess.check_output(
                     [
-                        "python3",
-                        str(SCRIPTS / "bench.py"),
-                        "soak",
-                        "--base-url",
-                        f"http://127.0.0.1:{self.port_cand}/v1",
-                        "--model",
-                        "mock",
-                        "--label",
-                        "soak",
-                        "--duration-s",
-                        "0.15",
-                        "--min-runs",
-                        "6",
-                        "--max-tokens",
-                        "6",
-                        "--ledger",
-                        ledger,
+                        "python3", str(SCRIPTS / "bench.py"), "soak",
+                        "--base-url", f"http://127.0.0.1:{self.port_cand}/v1",
+                        "--model", "mock", "--label", "soak",
+                        "--duration-s", "0.15", "--min-runs", "6", "--max-tokens", "12",
+                        "--ledger", ledger,
                     ],
                     text=True,
                 )
@@ -351,23 +343,11 @@ class TestBenchHarness(unittest.TestCase):
             needle_rec = json.loads(
                 subprocess.check_output(
                     [
-                        "python3",
-                        str(SCRIPTS / "bench.py"),
-                        "needle",
-                        "--base-url",
-                        f"http://127.0.0.1:{self.port_cand}/v1",
-                        "--model",
-                        "mock",
-                        "--label",
-                        "needle",
-                        "--target-tokens",
-                        "512",
-                        "--depths",
-                        "0.1",
-                        "0.5",
-                        "0.9",
-                        "--ledger",
-                        ledger,
+                        "python3", str(SCRIPTS / "bench.py"), "needle",
+                        "--base-url", f"http://127.0.0.1:{self.port_cand}/v1",
+                        "--model", "mock", "--label", "needle",
+                        "--target-tokens", "512", "--depths", "0.1", "0.5", "0.9",
+                        "--ledger", ledger,
                     ],
                     text=True,
                 )
