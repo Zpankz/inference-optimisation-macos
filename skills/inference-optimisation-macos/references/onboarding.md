@@ -8,14 +8,14 @@ Run the read-only host probe and native Metal copy benchmark:
 
 ```bash
 bash "$SKILL_DIR/scripts/probe_apple_silicon.sh"
-swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
+bash "$SKILL_DIR/scripts/measure_bw_metal.sh"
 ```
 
 Fix any `[WARN]` lines before measuring:
 
 - Plug into AC power and disable Low Power Mode (`sudo pmset -a lowpowermode 0`).
 - If `iogpu.wired_limit_mb` is `0` on a 32 GB+ Mac and your target model + KV exceeds 65% of RAM, raise it safely (75-80% of physical RAM, leaving OS headroom).
-- Note the measured `measured_bw_median_gbs` from `measure_bw_metal.swift` and pass it to `ceiling.py --bw-gbs`.
+- Note the measured `measured_bw_median_gbs` from `measure_bw_metal.sh` and pass it to `ceiling.py --bw-gbs`.
 
 ## 2. Screen 2-3 Candidate Engines (~60s Each)
 

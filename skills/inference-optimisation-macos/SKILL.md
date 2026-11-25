@@ -20,7 +20,7 @@ Note: Invoke bundled scripts using their path relative to this skill directory (
 ## Core Principles
 
 - **Best engine before flag tuning**: On Apple Silicon, picking the right runtime (`mlx_lm.server`, `vllm-mlx`, `oMLX`, or `llama-server`) often beats the first ten flag tweaks. Use `bench.py screen` and `references/onboarding.md` on a new machine first.
-- **Ceilings before tuning**: Measure real sustained unified-memory bandwidth (`swift scripts/measure_bw_metal.swift`) and compute the theoretical decode ceiling (`scripts/ceiling.py`) first. If single-stream decode is already at 75-85% of bandwidth (or 55-72% for sparse MoE), switch from decode flags to prefill, prompt caching, concurrency, or active-byte levers.
+- **Ceilings before tuning**: Measure real sustained unified-memory bandwidth (`bash scripts/measure_bw_metal.sh`) and compute the theoretical decode ceiling (`scripts/ceiling.py`) first. If single-stream decode is already at 75-85% of bandwidth (or 55-72% for sparse MoE), switch from decode flags to prefill, prompt caching, concurrency, or active-byte levers.
 - **One lever at a time, above the A/A noise floor**: Never stack unmeasured flags. Run an A/A baseline check (`bench.py aa`) to measure host noise, then run interleaved `control -> candidate -> control` trials and log both wins and dead ends in `PLAN.md` / `DEAD-ENDS.md` and `ledger.jsonl`.
 - **Single-GPU serialization**: Always serialize benchmark runs through `scripts/queue.sh` (portable `fcntl.flock` in a private per-user `0700` directory) so overlapping jobs never share unified memory bandwidth.
 - **Reject broken speedups automatically**: `bench.py` flags and excludes `COALESCED` (<50 ms decode window), `DEGENERATE` (char-flood / n-gram loops), and `IMPLAUSIBLE` samples so broken configs can never win a sweep.
@@ -33,7 +33,7 @@ Run the environment probe and (optionally) the native Swift/Metal bandwidth micr
 
 ```bash
 bash "$SKILL_DIR/scripts/probe_apple_silicon.sh"
-swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
+bash "$SKILL_DIR/scripts/measure_bw_metal.sh"
 ```
 
 Verify all `[PASS]` hygiene checks before benchmarking (full checklist in `references/methodology.md`):

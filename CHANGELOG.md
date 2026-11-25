@@ -2,7 +2,7 @@
 
 ## 1.1.0 — 2026-11-26
 
-- Added native Swift + Metal unified-memory bandwidth and `MTLDevice` probe (`scripts/measure_bw_metal.swift`).
+- Added native Swift + Metal unified-memory bandwidth and `MTLDevice` probe (`scripts/measure_bw_metal.sh`).
 - Hardened `scripts/bench.py` with `COALESCED`, `DEGENERATE`, and `IMPLAUSIBLE` sample guards (preventing single-chunk degenerate responses from reporting fake 100k+ tok/s).
 - Added `bench.py screen` (60-second engine bake-off: prose, code, two-turn prefix cache, greedy determinism), `bench.py aa` (empirical A/A noise-floor calibration), and `--calibrate-tokenizer` prompt sizing.
 - Upgraded `scripts/queue.sh` to portable Python `fcntl.flock` inside a private `0700` per-user directory with `O_NOFOLLOW` symlink checks.

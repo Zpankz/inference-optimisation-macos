@@ -11,7 +11,7 @@ On macOS, though, its original harness assumed Linux + CUDA/XPU (`flock(1)`, `/p
 ## Why Python + native Swift/Metal (and not Rust or Go)
 
 - **Harness (`bench.py`, `ceiling.py`, `mem_macos.py`, `queue.sh`) stays stdlib Python + Bash**: Against a local LLM generating 10–200 tok/s, client SSE parsing in Python takes ~0.05–0.2 ms per token (<0.5% of inter-token latency). Rewriting the harness in Rust or Go would add toolchain/binary friction and break instant agent editability for no measurable gain.
-- **Hardware bandwidth probe (`measure_bw_metal.swift`) uses native Swift + Metal**: Measuring sustained unified-memory bandwidth and querying `MTLCreateSystemDefaultDevice()` (`recommendedMaxWorkingSetSize`, `currentAllocatedSize`) actually benefits from native Metal APIs—and `swift` ships with macOS Xcode Command Line Tools, so there is still zero Cargo, Go, or Homebrew setup required.
+- **Hardware bandwidth probe (`measure_bw_metal.sh`) uses native Swift + Metal**: Measuring sustained unified-memory bandwidth and querying `MTLCreateSystemDefaultDevice()` (`recommendedMaxWorkingSetSize`, `currentAllocatedSize`) actually benefits from native Metal APIs—and `swift` ships with macOS Xcode Command Line Tools, so there is still zero Cargo, Go, or Homebrew setup required.
 
 ## What is in here
 
@@ -24,7 +24,7 @@ On macOS, though, its original harness assumed Linux + CUDA/XPU (`flock(1)`, `/p
   - `gotchas.md` — field-observed macOS failure modes (coalesced single-chunk fake 863k tok/s responses, reboot-reset wired limits, headless Mac Studio 338–620 MHz stuck GPU clocks, looped-model ceiling overstatement, `mx.compile` retracing, MTP bandwidth regressions, `--no-mmap` load hangs, reasoning-model needle truncation).
 - `skills/inference-optimisation-macos/scripts/` — zero-dependency harness:
   - `probe_apple_silicon.sh` — detects SoC, P/E/GPU cores, RAM, `iogpu.wired_limit_mb`, power/thermal state, installed runtimes, and prints `[PASS]`/`[WARN]` hygiene gates.
-  - `measure_bw_metal.swift` — native Swift + Metal probe querying `MTLDevice` and timing `MTLBlitCommandEncoder` shared-buffer copies to measure real sustained GB/s.
+  - `measure_bw_metal.sh` — native Swift + Metal probe querying `MTLDevice` and timing `MTLBlitCommandEncoder` shared-buffer copies to measure real sustained GB/s.
   - `ceiling.py` — computes single-stream and non-double-counted concurrent ceilings, `--loop-multiplier`, realistic dense/MoE bands, `kv_crossover_ctx`, and GiB unified-memory headroom.
   - `queue.sh` — portable single-GPU lock serializer using Python's `fcntl.flock` inside a private per-user `0700` directory with `O_NOFOLLOW` symlink checks.
   - `mem_macos.py` — passwordless `ioreg -r -c IOAccelerator` GPU residency alongside `sysctl`, `vm_stat`, `memory_pressure -Q`, `pmset -g therm`, `ps`, and optional `mlx.core` allocator stats.
@@ -51,7 +51,7 @@ export SKILL_DIR="./skills/inference-optimisation-macos"
 
 # 1. Check hardware/thermal hygiene and measure real Metal memory bandwidth
 bash "$SKILL_DIR/scripts/probe_apple_silicon.sh"
-swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
+bash "$SKILL_DIR/scripts/measure_bw_metal.sh"
 
 # 2. Compute your bandwidth ceiling and KV-crossover context
 python3 "$SKILL_DIR/scripts/ceiling.py" \
@@ -98,7 +98,7 @@ python3 "$SKILL_DIR/scripts/bench.py" aa --ledger ledger.jsonl --label "ctl-pre-
 python3 -m unittest discover -s tests -v
 ```
 
-CI runs the full test suite on both `macos-latest` (Apple Silicon, including `swiftc -typecheck` on `measure_bw_metal.swift`) and `ubuntu-latest`.
+CI runs the full test suite on both `macos-latest` (Apple Silicon) and `ubuntu-latest`.
 
 ## Credits and prior art
 

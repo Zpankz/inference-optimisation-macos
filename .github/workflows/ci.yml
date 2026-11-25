@@ -31,9 +31,8 @@ jobs:
       - name: Run harness test suite
         run: python3 -m unittest discover -s tests -v
 
-      - name: Swift/Metal typecheck & macOS probe smoke test
+      - name: Live macOS probe & memory smoke test
         if: runner.os == 'macOS'
         run: |
-          swiftc -typecheck skills/inference-optimisation-macos/scripts/measure_bw_metal.swift
           bash skills/inference-optimisation-macos/scripts/probe_apple_silicon.sh
           python3 skills/inference-optimisation-macos/scripts/mem_macos.py --pid $$ --json

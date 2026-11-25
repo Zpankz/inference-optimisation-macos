@@ -7,7 +7,7 @@ Calculate hardware ceilings before tuning any server flag. On Apple Silicon unif
 Apple publishes theoretical peak bus bandwidth in decimal GB/s (`1e9 bytes/s`). Sustained GPU copy bandwidth is typically 80-92% of spec peak. Run the bundled native Swift/Metal probe on your Mac to measure real sustained unified-memory bandwidth directly:
 
 ```bash
-swift "$SKILL_DIR/scripts/measure_bw_metal.swift"
+bash "$SKILL_DIR/scripts/measure_bw_metal.sh"
 ```
 
 Pass the reported `measured_bw_median_gbs` to `scripts/ceiling.py --bw-gbs` for the most accurate ceiling, or use the M1-M6 spec-sheet presets below as a starting point.

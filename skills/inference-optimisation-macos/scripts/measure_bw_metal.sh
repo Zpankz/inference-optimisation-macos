@@ -1,9 +1,21 @@
-#!/usr/bin/env swift
-// Zero-dependency native Metal unified-memory bandwidth & MTLDevice probe for macOS Apple Silicon.
-// Run directly via: swift scripts/measure_bw_metal.swift [--mb 512] [--iters 20] [--json]
-// Uses MTLBlitCommandEncoder device-to-device copy (reads + writes = 2x bytes moved) to measure
-// real sustained unified-memory bandwidth in decimal GB/s for `scripts/ceiling.py --bw-gbs`.
+#!/usr/bin/env bash
+# Zero-dependency native Metal unified-memory bandwidth & MTLDevice probe for macOS Apple Silicon.
+# Usage: bash scripts/measure_bw_metal.sh [--mb 512] [--iters 20] [--json]
+# Uses MTLBlitCommandEncoder device-to-device copy (reads + writes = 2x bytes moved) to measure
+# real sustained unified-memory bandwidth in decimal GB/s for `scripts/ceiling.py --bw-gbs`.
+set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Error: measure_bw_metal.sh requires macOS with Metal and Xcode Command Line Tools." >&2
+  exit 1
+fi
+
+if ! command -v swift >/dev/null 2>&1; then
+  echo "Error: swift not found. Install Xcode Command Line Tools (xcode-select --install)." >&2
+  exit 1
+fi
+
+exec swift - "$@" <<'SWIFT'
 import Foundation
 import Metal
 
@@ -44,7 +56,6 @@ guard let src = device.makeBuffer(length: byteCount, options: .storageModeShared
     exit(1)
 }
 
-// Touch pages so both buffers are faulted in before timing.
 memset(src.contents(), 0x5A, byteCount)
 memset(dst.contents(), 0x00, byteCount)
 
@@ -63,14 +74,12 @@ func runCopy() -> Double {
     return max(t1 - t0, 1e-9)
 }
 
-// Warm-up passes
 _ = runCopy()
 _ = runCopy()
 
 var bwSamples: [Double] = []
 for _ in 0..<iters {
     let dt = runCopy()
-    // Blit copy reads `byteCount` and writes `byteCount` => 2 * byteCount total bus traffic (decimal GB/s).
     let gbs = (Double(byteCount) * 2.0) / dt / 1e9
     bwSamples.append(gbs)
 }
@@ -103,3 +112,4 @@ if emitJSON {
     print(String(format: "Measured copy BW (median):    %.2f GB/s  (peak: %.2f GB/s across %d x %d MiB blits)", medianGBs, peakGBs, iters, sizeMB))
     print("Tip: Pass --bw-gbs \(String(format: "%.1f", medianGBs)) to scripts/ceiling.py for an empirically grounded ceiling.")
 }
+SWIFT
